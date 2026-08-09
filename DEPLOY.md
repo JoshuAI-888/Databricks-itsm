@@ -1,6 +1,69 @@
 # Deployment Runbook: Support Ticket App on Databricks Apps + Lakebase
 
-This is a click-by-click guide to deploying this app. It assumes you have a Databricks workspace but have **never** used Lakebase or Databricks Apps before. Every term is explained on first use. Follow the sections in order.
+> **Two ways to deploy.** You can either let **Claude Code run the whole thing end-to-end** (Section 0 below — you set up credentials once, then it executes every step for you), or follow the **manual click-by-click guide** (Sections 1–10). Section 0 explains what must be configured for the automated path; if you'd rather do it yourself, skip to Section 1.
+
+---
+
+## 0. Let Claude Code deploy this end-to-end (automated path)
+
+For Claude Code to provision Lakebase, create the app, and deploy it for you, **four things must all be true**. None are set up by default — this session runs in a sandboxed container that can't reach Databricks until you configure them.
+
+| # | What | Why it matters |
+|---|---|---|
+| 1 | **Databricks CLI in the session** | The tool used to create instances/apps and deploy. Claude installs it once #2–3 exist. |
+| 2 | **Credentials (auth)** | An identity + secret so the CLI can act as you. |
+| 3 | **Network egress to your workspace** | The container sits behind an egress proxy. Outbound HTTPS to your workspace host must be **allowed by the environment's network policy** — the most likely blocker. |
+| 4 | **Permissions on that identity** | It must be entitled to create Lakebase instances + Apps and to deploy. |
+
+### 0.1 Credentials — pick one path
+
+**Path A — Personal Access Token (fastest)**
+1. In your workspace: avatar → **Settings → Developer → Access tokens → Generate new token**. Copy it.
+2. Note your workspace URL: `https://<...>.cloud.databricks.com` (AWS), `...azuredatabricks.net` (Azure), or `...gcp.databricks.com` (GCP).
+
+**Path B — Service principal (recommended for automation)**
+1. **Settings → Identity and access → Service principals → Add**, then generate an **OAuth secret** (client ID + secret).
+2. Grant it the entitlements in 0.4. This keeps the "deployer" identity separate from the app's own runtime service principal, and is easily revocable.
+
+### 0.2 Store the secrets in the environment (NOT in chat, NOT in the repo)
+
+Set these as **environment variables on the Claude Code environment** (environment settings at claude.ai/code — see <https://code.claude.com/docs/en/claude-code-on-the-web>). Never paste a token into the conversation or commit it to git.
+
+- Path A: `DATABRICKS_HOST=https://<workspace-url>` and `DATABRICKS_TOKEN=<token>`
+- Path B: `DATABRICKS_HOST=…`, `DATABRICKS_CLIENT_ID=…`, `DATABRICKS_CLIENT_SECRET=…`
+
+### 0.3 Network egress
+
+The environment's **network policy** must permit outbound HTTPS to your workspace host (`*.cloud.databricks.com` / `*.azuredatabricks.net` / `*.gcp.databricks.com`). If the environment is on a restrictive policy, deployment can't reach Databricks regardless of credentials — you'd need an environment whose policy allows that host. This is the one item that cannot be worked around from inside the sandbox.
+
+### 0.4 Permissions the identity needs
+
+- Workspace access (Workspace admin, or a user/SP with the rights below)
+- **Lakebase**: entitlement to **create database instances**
+- **Databricks Apps**: permission to **create and deploy apps**
+- **Unity Catalog**: any catalog/schema privileges your setup requires
+- Ability to run the runtime `GRANT`s as the instance owner (Section 5)
+
+### 0.5 Optional: make every session deploy-ready automatically
+
+Add a **SessionStart hook / setup script** that installs the CLI and verifies auth on each fresh session:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+databricks current-user me   # fails loudly if auth or egress isn't working
+```
+
+### 0.6 What Claude Code then does for you
+
+Install the CLI → `databricks current-user me` to confirm auth + egress → create the Lakebase instance → run `scripts/init_db.py` (schema + sample data) → create the App → attach the Lakebase resource and set env vars → run the `GRANT`s → `databricks sync` + `databricks apps deploy` → run the Section 9 test checklist and report back. In short, Sections 1–10 executed rather than done by hand.
+
+> **First live check:** once `DATABRICKS_HOST` and the secret are set, `databricks current-user me` is the single command that confirms both auth and egress at once. If it fails on the network, the fix is the environment's network policy (0.3); if it fails on auth, it's the credentials (0.1).
+
+---
+
+## The manual path (Sections 1–10)
+
+This is a click-by-click guide to deploying this app by hand. It assumes you have a Databricks workspace but have **never** used Lakebase or Databricks Apps before. Every term is explained on first use. Follow the sections in order.
 
 **Key terms used throughout:**
 
