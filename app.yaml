@@ -1,0 +1,22 @@
+# Databricks Apps runtime configuration.
+# Databricks routes traffic to port 8000, so Streamlit must listen there.
+command:
+  - "streamlit"
+  - "run"
+  - "app.py"
+  - "--server.port=8000"
+  - "--server.address=0.0.0.0"
+
+env:
+  # Name of the Lakebase database instance this app connects to.
+  # Set the value to YOUR instance name (see DEPLOY.md, step 3).
+  - name: "LAKEBASE_INSTANCE_NAME"
+    value: "support-lakebase"
+  - name: "PGDATABASE"
+    value: "databricks_postgres"
+  - name: "PGSSLMODE"
+    value: "require"
+  - name: "STREAMLIT_GATHER_USAGE_STATS"
+    value: "false"
+  # NOTE: PGPASSWORD is intentionally NOT set here. The app mints a short-lived
+  # OAuth token at runtime via the Databricks SDK, so no secret is stored.

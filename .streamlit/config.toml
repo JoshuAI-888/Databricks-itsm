@@ -1,0 +1,16 @@
+# Streamlit base theme aligned to the Milford palette. The full glass styling
+# is injected from theme.py; this sets sensible native defaults.
+[theme]
+primaryColor = "#e1690e"
+backgroundColor = "#f6f8f9"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#303c42"
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
