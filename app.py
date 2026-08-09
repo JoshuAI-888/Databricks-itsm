@@ -8,7 +8,7 @@ is stored in memory.
 from __future__ import annotations
 
 import html
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import streamlit as st
 
@@ -27,6 +27,21 @@ st.set_page_config(
 theme.inject()
 
 st.session_state.setdefault("selected_ticket_id", None)
+
+# =============================================================================
+# Reporting constants
+# =============================================================================
+PERIOD_OPTIONS = [
+    "Last 7 days",
+    "Last 30 days",
+    "Last 90 days",
+    "This month",
+    "This quarter",
+    "This year",
+    "All time",
+    "Custom…",
+]
+DEFAULT_PERIOD = "Last 30 days"
 
 
 # =============================================================================
@@ -73,6 +88,58 @@ def humanize(ts) -> str:
 
 def esc(text) -> str:
     return html.escape(str(text)) if text is not None else ""
+
+
+def _fmt_date_range(d1: date, d2: date) -> str:
+    """Short human range for a custom period, e.g. '1 Jul – 9 Aug 2026'."""
+    if d1.year == d2.year and d1.month == d2.month:
+        return f"{d1:%-d} – {d2:%-d %b %Y}"
+    if d1.year == d2.year:
+        return f"{d1:%-d %b} – {d2:%-d %b %Y}"
+    return f"{d1:%-d %b %Y} – {d2:%-d %b %Y}"
+
+
+def resolve_period(
+    choice: str, custom_from: date | None, custom_to: date | None
+) -> tuple[datetime | None, datetime | None, str]:
+    """Turn a period preset (+ optional custom range) into a (from, to, label) triple.
+
+    `from`/`to` are timezone-aware UTC datetimes ready to hand straight to
+    db.* queries (None = unbounded, only for "All time"). Falls back to the
+    last 30 days on an invalid or not-yet-chosen custom range, rather than
+    crashing or querying garbage.
+    """
+    now = datetime.now(timezone.utc)
+    fallback_from, fallback_to = now - timedelta(days=30), now
+
+    if choice == "Last 7 days":
+        return now - timedelta(days=7), now, choice
+    if choice == "Last 30 days":
+        return now - timedelta(days=30), now, choice
+    if choice == "Last 90 days":
+        return now - timedelta(days=90), now, choice
+    if choice == "This month":
+        return datetime(now.year, now.month, 1, tzinfo=timezone.utc), now, choice
+    if choice == "This quarter":
+        q_start_month = (now.month - 1) // 3 * 3 + 1
+        return datetime(now.year, q_start_month, 1, tzinfo=timezone.utc), now, choice
+    if choice == "This year":
+        return datetime(now.year, 1, 1, tzinfo=timezone.utc), now, choice
+    if choice == "All time":
+        return None, None, choice
+
+    # Custom… — not yet initialised (widgets render below this point) falls
+    # back quietly; a genuinely inverted range warns before falling back.
+    if custom_from is None or custom_to is None:
+        return fallback_from, fallback_to, "Last 30 days"
+    if custom_from > custom_to:
+        st.warning("The custom range's From date is after To — showing the last 30 days instead.")
+        return fallback_from, fallback_to, "Last 30 days"
+    return (
+        datetime.combine(custom_from, time.min, tzinfo=timezone.utc),
+        datetime.combine(custom_to, time.max, tzinfo=timezone.utc),
+        _fmt_date_range(custom_from, custom_to),
+    )
 
 
 USER = current_user()
@@ -157,7 +224,12 @@ def render_header():
 # =============================================================================
 # Stats dashboard
 # =============================================================================
-def render_stats(stats: dict):
+def render_stats(stats: dict, period_label: str, basis_label: str):
+    verb = {"Date raised": "Tickets raised", "Last activity": "Tickets active"}.get(
+        basis_label, "Tickets"
+    )
+    st.caption(f"{verb} · {period_label}")
+
     tiles = [
         ("Total tickets", stats["total"], theme.SLATE),
         ("Open", stats["open"], theme.BLUE),
@@ -196,13 +268,198 @@ def render_stats(stats: dict):
         <div class="mf-glass" style="padding:16px 18px;margin-top:14px">
           <div class="label" style="font-size:12px;color:{theme.MUTED};
                text-transform:uppercase;letter-spacing:0.06em;font-weight:600;
-               margin-bottom:10px">Status distribution</div>
+               margin-bottom:10px">Status distribution · {esc(period_label)}</div>
           <div class="mf-distbar">{segments or '<span style="width:100%;background:#e9edee"></span>'}</div>
           <div class="mf-legend">{legend or 'No tickets yet'}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+# =============================================================================
+# Reporting
+# =============================================================================
+def _bucket_label(bucket, grain: str) -> str:
+    """Format a volume_over_time bucket for the chart axis, per grain."""
+    if isinstance(bucket, str):
+        return bucket
+    if grain == "day":
+        return bucket.strftime("%d %b")
+    if grain == "week":
+        return f"w/o {bucket.strftime('%d %b')}"
+    return bucket.strftime("%b %Y")
+
+
+def _auto_grain(date_from, date_to) -> str:
+    """Pick a bucket size from the period length; open-ended/unknown -> month."""
+    if date_from is None or date_to is None:
+        return "month"
+    days = (date_to - date_from).days
+    if days <= 31:
+        return "day"
+    if days <= 180:
+        return "week"
+    return "month"
+
+
+def _fmt_duration(hours) -> str:
+    """Render an hour count as 'X.X days' above 48h, else 'X.X hrs'."""
+    if hours is None:
+        return "—"
+    if hours >= 48:
+        return f"{hours / 24:.1f} days"
+    return f"{hours:.1f} hrs"
+
+
+def _render_hbar_card(title: str, items: list[dict], color_of, empty_msg: str):
+    """A ranked horizontal-bar card in the mf-glass style, shared by both breakdowns."""
+    if not items:
+        st.markdown(
+            f'<div class="mf-glass mf-empty" style="padding:28px 18px">'
+            f'<div class="big">{esc(title)}</div>{esc(empty_msg)}</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    peak = max(i["n"] for i in items) or 1
+    rows = ""
+    for i in items:
+        pct = i["n"] / peak * 100
+        color = color_of(i["key"])
+        label = esc(str(i["key"]).replace("_", " ").capitalize())
+        rows += f"""
+        <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+          <div style="width:96px;flex:0 0 auto;font-size:12.5px;font-weight:600;
+               color:{theme.SLATE_2};white-space:nowrap;overflow:hidden;
+               text-overflow:ellipsis" title="{label}">{label}</div>
+          <div style="flex:1 1 auto;height:10px;border-radius:999px;
+               background:{theme.CLOUD};overflow:hidden">
+            <div style="width:{pct:.1f}%;height:100%;border-radius:999px;
+                 background:{color}"></div>
+          </div>
+          <div style="width:30px;flex:0 0 auto;text-align:right;font-size:12.5px;
+               font-weight:700;color:{theme.SLATE}">{i["n"]}</div>
+        </div>
+        """
+    st.markdown(
+        f"""
+        <div class="mf-glass" style="padding:16px 18px">
+          <div class="label" style="font-size:12px;color:{theme.MUTED};
+               text-transform:uppercase;letter-spacing:0.06em;font-weight:600;
+               margin-bottom:6px">{esc(title)}</div>
+          {rows}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_reporting(date_from, date_to, date_basis: str, period_label: str):
+    """Aggregate reporting for the active period: volume trend, breakdowns, resolution time.
+
+    Each panel wraps its own db call so one failing query only takes down
+    that panel, and each degrades to a friendly empty state with no data.
+    """
+    with st.expander("📊 Reporting", expanded=False):
+        st.caption(f"Scoped to {period_label} · {db.DATE_BASES.get(date_basis, date_basis)}")
+
+        # --- Volume over time -------------------------------------------------
+        st.markdown("**Volume over time**")
+        grain = _auto_grain(date_from, date_to)
+        try:
+            volume = db.volume_over_time(
+                date_from=date_from, date_to=date_to, date_basis=date_basis, grain=grain
+            )
+        except Exception as err:
+            st.error(f"Couldn't load ticket volume: {err}")
+        else:
+            if not volume or not any(r["n"] for r in volume):
+                st.markdown(
+                    '<div class="mf-glass mf-empty"><div class="big">No tickets in this period</div>'
+                    "Widen the period to see a volume trend.</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                grain_col = {"day": "Day", "week": "Week starting", "month": "Month"}[grain]
+                chart_data = {
+                    grain_col: [_bucket_label(r["bucket"], grain) for r in volume],
+                    "Tickets": [r["n"] for r in volume],
+                }
+                st.bar_chart(
+                    chart_data, x=grain_col, y="Tickets", color=theme.ORANGE,
+                    use_container_width=True,
+                )
+                st.caption(f"Bucketed by {grain}.")
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # --- Breakdowns: category / priority -----------------------------------
+        b1, b2 = st.columns(2, gap="medium")
+        with b1:
+            try:
+                cat_rows = db.breakdown(
+                    "category", date_from=date_from, date_to=date_to, date_basis=date_basis
+                )
+            except Exception as err:
+                st.error(f"Couldn't load the category breakdown: {err}")
+            else:
+                _render_hbar_card(
+                    "By category", cat_rows, lambda _k: theme.PURPLE,
+                    "No tickets in this period.",
+                )
+        with b2:
+            try:
+                pri_rows = db.breakdown(
+                    "priority", date_from=date_from, date_to=date_to, date_basis=date_basis
+                )
+            except Exception as err:
+                st.error(f"Couldn't load the priority breakdown: {err}")
+            else:
+                _render_hbar_card(
+                    "By priority", pri_rows,
+                    lambda k: theme.PRIORITY_COLORS.get(k, theme.MUTED),
+                    "No tickets in this period.",
+                )
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # --- Resolution time -----------------------------------------------------
+        st.markdown("**Resolution time**")
+        try:
+            res = db.resolution_stats(date_from=date_from, date_to=date_to, date_basis=date_basis)
+        except Exception as err:
+            st.error(f"Couldn't load resolution stats: {err}")
+        else:
+            if not res or not res.get("resolved_count"):
+                st.markdown(
+                    '<div class="mf-glass mf-empty"><div class="big">No resolved tickets in this period</div>'
+                    "Resolution time appears once tickets are marked resolved.</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                tiles = [
+                    ("Resolved", str(res["resolved_count"]), theme.GREEN),
+                    ("Median", _fmt_duration(res.get("median_hours")), theme.BLUE),
+                    ("Average", _fmt_duration(res.get("avg_hours")), theme.AMBER),
+                    ("P90", _fmt_duration(res.get("p90_hours")), theme.PURPLE),
+                ]
+                cols = st.columns(4, gap="medium")
+                for col, (label, shown, color) in zip(cols, tiles):
+                    col.markdown(
+                        f"""
+                        <div class="mf-glass mf-stat">
+                          <div class="label">{label}</div>
+                          <div class="value">{shown}</div>
+                          <div class="accent" style="background:{color}"></div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                st.caption(
+                    "⚠ Approximate — there is no dedicated resolved-at timestamp, so this is "
+                    "measured as last activity minus created. Treat it as indicative, not exact."
+                )
 
 
 # =============================================================================
@@ -348,8 +605,22 @@ def main():
 
     render_header()
 
+    # Resolve the active reporting period from widget state set on a prior run
+    # (the period picker itself lives inside the toolbar, rendered below the
+    # stats it feeds — Streamlit persists widget values in session_state
+    # across reruns, so this read reflects the latest choice even though the
+    # widgets that write it are instantiated further down the script).
+    period_choice = st.session_state.get("period_choice", DEFAULT_PERIOD)
+    date_basis = st.session_state.get("date_basis", "created_at")
+    date_from, date_to, period_label = resolve_period(
+        period_choice,
+        st.session_state.get("period_from"),
+        st.session_state.get("period_to"),
+    )
+    basis_label = db.DATE_BASES.get(date_basis, date_basis)
+
     try:
-        stats = db.get_stats()
+        stats = db.get_stats(date_from=date_from, date_to=date_to, date_basis=date_basis)
     except Exception as err:
         st.error(
             "Couldn't reach Lakebase. Check that the database instance is running "
@@ -358,9 +629,9 @@ def main():
         st.exception(err)
         st.stop()
 
-    render_stats(stats)
+    render_stats(stats, period_label, basis_label)
 
-    # --- Toolbar: filters + new ticket --------------------------------------
+    # --- Toolbar: filters + period + new ticket ------------------------------
     with st.container(border=True):
         f1, f2, f3, f4 = st.columns([0.3, 0.3, 0.24, 0.16])
         status_filter = f1.multiselect(
@@ -375,10 +646,52 @@ def main():
         if f4.button("＋ New ticket", type="primary", use_container_width=True):
             new_ticket_dialog()
 
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+        # Row 2 only makes room for From/To when "Custom…" is selected, so the
+        # toolbar stays compact for the common presets.
+        show_custom = st.session_state.get("period_choice", DEFAULT_PERIOD) == "Custom…"
+        if show_custom:
+            g1, g2, g3, g4 = st.columns([0.22, 0.19, 0.19, 0.40])
+        else:
+            g1, g4 = st.columns([0.32, 0.68])
+            g2 = g3 = None
+
+        g1.selectbox(
+            "Period", PERIOD_OPTIONS,
+            index=PERIOD_OPTIONS.index(DEFAULT_PERIOD),
+            key="period_choice",
+            help="Which window of tickets the stats, reporting and list below cover.",
+        )
+        if g2 is not None:
+            default_to = datetime.now(timezone.utc).date()
+            default_from = default_to - timedelta(days=30)
+            g2.date_input("From", value=default_from, key="period_from")
+            g3.date_input("To", value=default_to, key="period_to")
+
+        g4.segmented_control(
+            "Date basis",
+            options=list(db.DATE_BASES.keys()),
+            format_func=lambda k: db.DATE_BASES[k],
+            default="created_at",
+            selection_mode="single",
+            key="date_basis",
+            help=(
+                "Date raised keeps a ticket fixed to the period it was created in — "
+                "stable for period-over-period reporting. Last activity moves a "
+                "ticket between periods every time it's touched."
+            ),
+        )
+
+    render_reporting(date_from, date_to, date_basis, period_label)
+
     tickets = db.list_tickets(
         statuses=status_filter or None,
         priorities=priority_filter or None,
         search=search or None,
+        date_from=date_from,
+        date_to=date_to,
+        date_basis=date_basis,
     )
 
     left, right = st.columns([0.46, 0.54], gap="large")

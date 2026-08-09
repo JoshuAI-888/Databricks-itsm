@@ -21,7 +21,10 @@ read from and written to Lakebase — nothing is hard-coded.
 | Update a ticket's status | Status dropdown → **Update** |
 | **Bonus** priority + category | Coloured badges on every ticket |
 | **Bonus** filter by status/priority + title search | Toolbar |
-| **Bonus** statistics dashboard | Stat tiles + status-distribution bar |
+| **Bonus** filter by time period | Toolbar — presets (last 7/30/90 days, this month/quarter/year) or a custom date range |
+| **Bonus** switch the reporting date basis | Toolbar — report on **date raised** or **last activity** |
+| **Bonus** statistics dashboard | Stat tiles + status-distribution bar, scoped to the selected period |
+| **Bonus** reporting section | Ticket volume over time, category & priority breakdowns, resolution-time metrics |
 | **Bonus** delete with confirmation | **Delete** → confirm modal |
 | **Bonus** input validation & friendly errors | Throughout |
 
@@ -47,11 +50,31 @@ Postgres password (`w.database.generate_database_credential(...)`).
 | `db.py` | Lakebase connection + all SQL data access |
 | `theme.py` | Milford palette, glass CSS, badge helpers |
 | `sql/schema.sql` | `tickets` + `ticket_messages` tables |
-| `sql/seed_data.sql` | 5 tickets, 2+ messages each, multiple statuses |
+| `sql/seed_data.sql` | 5 tickets, 2+ messages each, multiple statuses. **Truncates first** |
+| `sql/seed_more_tickets.sql` | 50 more tickets spread over ~12 months, for reporting. Additive + re-runnable |
 | `scripts/init_db.py` | One-off: applies schema + seed to Lakebase |
+| `scripts/seed_more.py` | Loads `seed_more_tickets.sql`; safe to run repeatedly |
 | `app.yaml` | Databricks Apps runtime config |
 | `requirements.txt` | `streamlit`, `psycopg[binary]`, `databricks-sdk` |
-| **`DEPLOY.md`** | **Step-by-step deploy runbook (start here)** |
+| **`DEPLOY.md`** | **Step-by-step deploy runbook (CLI-based)** |
+| **`manual_deploy.md`** | **Click-by-click deploy via the Databricks UI, no terminal needed** |
+
+## Reporting
+
+The toolbar carries a **period** control (presets or a custom range) and a **date basis**
+toggle. The basis matters more than it looks:
+
+- **Date raised** (`created_at`) — stable. A ticket never moves between periods, so
+  "tickets raised in July" gives the same answer forever. Use this for volume reporting.
+- **Last activity** (`updated_at`) — what was *worked on* in the period. Tickets migrate
+  between periods as they get touched, so totals aren't stable over time.
+
+The reporting section adds ticket volume over time (bucketed by day/week/month depending
+on range length), category and priority breakdowns, and resolution-time metrics.
+
+> **Caveat on resolution time.** There is no `resolved_at` column, so resolution time is
+> approximated as `updated_at - created_at` for tickets in `resolved`/`closed`. Any later
+> edit to a closed ticket inflates it. Treat it as indicative, not exact.
 
 ## Deploy
 
