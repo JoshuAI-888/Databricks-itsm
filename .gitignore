@@ -13,6 +13,9 @@ env/
 secrets.toml
 .streamlit/secrets.toml
 
+# Databricks CLI sync/bundle state
+.databricks/
+
 # OS / editor
 .DS_Store
 .idea/

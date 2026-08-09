@@ -156,10 +156,14 @@ A **database instance** is a running Lakebase (Postgres) server. You'll create o
 ### Option B — Using the CLI
 
 ```bash
-databricks database create-database-instance --name <LAKEBASE_INSTANCE_NAME>
+databricks database create-database-instance <LAKEBASE_INSTANCE_NAME> --capacity CU_1 --output json
 ```
 
-Replace `<LAKEBASE_INSTANCE_NAME>` with your chosen name (e.g. `support-db`). After it's ready, open the instance in the UI (Compute → Database instances) to read its **read/write DNS hostname** for `PGHOST`.
+Replace `<LAKEBASE_INSTANCE_NAME>` with your chosen name (e.g. `support-db`).
+
+> **Two easy mistakes here.** The name is a **positional argument** — `--name <NAME>` is not a valid flag and fails. And `--capacity` is listed as optional in `--help` but the API rejects the request without it (`Field instance.capacity must be defined`). `CU_1` is the smallest SKU.
+
+The command waits until the instance reaches `AVAILABLE` and prints the instance JSON. Read `read_write_dns` from that output — that is your `PGHOST`, so you don't need to open the UI. (It's also on the instance page under Compute → Database instances.)
 
 ### Record these values
 
@@ -198,13 +202,13 @@ export LAKEBASE_INSTANCE_NAME="<LAKEBASE_INSTANCE_NAME>"
 export PGHOST="<PGHOST>"                 # read/write DNS hostname from Section 3
 export PGDATABASE="databricks_postgres"
 export PGPORT="5432"
-export PGUSER="<your-databricks-username>"   # your login email, e.g. joshuafang@gmail.com
+export PGUSER="<your-databricks-username>"   # from `databricks current-user me`
 export PGSSLMODE="require"
 export PGPASSWORD="<paste-the-token-from-above>"
 ```
 
-- `PGUSER` for this manual step is **your own Databricks username** (usually your login email). You are connecting as yourself.
-- `PGPASSWORD` is the OAuth token you just generated.
+- `PGUSER` for this manual step is **your own Databricks username**. You are connecting as yourself. Don't assume it matches the email you sign in to other services with — read the exact value from `databricks current-user me` (the `userName` field). A one-character difference produces a confusing `password authentication failed`.
+- `PGPASSWORD` is the OAuth token you just generated. You can skip setting it entirely if you leave `PGHOST`/`PGUSER`/`PGPASSWORD` unset and set only `LAKEBASE_INSTANCE_NAME` — `db.py` then mints a token through the SDK using your CLI login, exactly as the deployed app does.
 
 ### Option A (recommended): run the provided init script
 
@@ -244,13 +248,21 @@ The deployed app does **not** run as you — it runs as its own **service princi
 
 > **Ordering note:** The service principal ID is only shown **after** you create the app in **Section 6**. So you will likely do Section 6 first, come back here with the ID, then run these grants. That's expected — this section is placed here because it's conceptually part of database setup, but it depends on Section 6. **Do Section 6, then return here.**
 
-Once you have the service principal ID (a value like `1234-5678-abcdefgh` shown on the app's detail page), connect to the database **as the instance owner** (that's you — use the same `psql` connection from Section 4, or the init approach, with a fresh token if needed).
+Once you have the service principal ID (the app's `service_principal_client_id`, a UUID like `a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d`), connect to the database **as the instance owner** (that's you — use the same `psql` connection from Section 4, or the init approach, with a fresh token if needed).
 
-Run this SQL, replacing `<service-principal-id>` with the real ID (keep the double quotes):
+> **The `CREATE ROLE` below is usually unnecessary.** If you attached the Lakebase instance as an app resource when the app was created (Section 6 / 7), Databricks has **already created the Postgres role** for the service principal, with `LOGIN`. Running `CREATE ROLE` then fails with `role already exists`. Check first:
+>
+> ```sql
+> SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname = '<service-principal-id>';
+> ```
+>
+> If it returns a row, skip straight to the `GRANT`s. What Databricks does *not* do for you is grant privileges on tables **you** created — that's why the rest of this section still matters, and why skipping it produces `permission denied for table`.
+
+Run this SQL, replacing `<service-principal-id>` with the real ID (keep the double quotes — the UUID is not a valid bare identifier):
 
 ```sql
 -- Create a Postgres role for the app's service principal.
--- If the role already exists, this errors harmlessly — you can skip it.
+-- SKIP THIS if the query above already returned a row (the usual case).
 CREATE ROLE "<service-principal-id>" WITH LOGIN;
 
 -- Let the role use the schema.
@@ -269,7 +281,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO "<service-principal-id>";
 ```
 
-If the app later shows `permission denied for table`, it almost always means these grants were missed or the wrong ID was used — re-run this block.
+Verify the grants landed before deploying — this is faster than debugging a broken app:
+
+```sql
+SELECT has_table_privilege('<service-principal-id>', 'tickets', 'SELECT') AS can_read,
+       has_table_privilege('<service-principal-id>', 'tickets', 'INSERT') AS can_write;
+```
+
+Both should be `t`. If the app later shows `permission denied for table`, it almost always means these grants were missed or the wrong ID was used — re-run this block.
 
 ---
 
@@ -285,6 +304,33 @@ A **Databricks App** is the hosted web application that will serve the Streamlit
 6. Click **Create**.
 7. On the app's detail page, find the **service principal** (sometimes labeled "App identity" or "Client ID"). **Copy this ID.**
 8. **Go back to Section 5 now** and run the grant SQL with this ID before continuing.
+
+### Faster: create the app with the database already attached
+
+The CLI can create the app *and* attach the Lakebase resource in a single call, which collapses the Section 6 → 5 → 7 round-trip. `databricks apps create` has no `--resources` flag, but `--json` accepts the full request body:
+
+```bash
+cat > app-create.json <<'JSON'
+{
+  "name": "support-app",
+  "description": "Milford Support Desk",
+  "resources": [
+    {
+      "name": "lakebase",
+      "database": {
+        "instance_name": "<LAKEBASE_INSTANCE_NAME>",
+        "database_name": "databricks_postgres",
+        "permission": "CAN_CONNECT_AND_CREATE"
+      }
+    }
+  ]
+}
+JSON
+
+databricks apps create --json @app-create.json --output json
+```
+
+The response contains `service_principal_client_id` — the ID Section 5 needs — and the resource attachment of Section 7 is already done. You still need the `GRANT`s in Section 5.
 
 ---
 
@@ -374,7 +420,10 @@ Open the app's URL and verify each item. Each one exercises the database, so pas
 | `password authentication failed` / token expired | Your OAuth token expired (60-min lifetime). For manual steps, regenerate it (Section 4) and re-export `PGPASSWORD`. For the deployed app, redeploy (Section 8) — it mints tokens automatically, so this usually means a transient issue or a stale deploy. |
 | App shows a connection error | Check the app's environment variables. `LAKEBASE_INSTANCE_NAME` and `PGHOST` must be correct (Section 7), and the Lakebase instance must be attached as a resource. |
 | Blank page or "site can't be reached" / wrong port | Ensure `app.yaml` runs Streamlit on port 8000: `--server.port=8000 --server.address=0.0.0.0`. Databricks Apps only routes to port 8000. |
-| `psycopg` build / compilation errors during install | Make sure `requirements.txt` uses `psycopg[binary]` (the pre-compiled wheel), not plain `psycopg`. The `[binary]` extra avoids needing a C compiler. |
+| `psycopg` build / compilation errors during install | Make sure `requirements.txt` uses `psycopg[binary]` (the pre-compiled wheel), not plain `psycopg`. The `[binary]` extra avoids needing a C compiler. If you're on a very new Python (3.14+), no binary wheel may exist yet — create the venv with an older interpreter, e.g. `python3.12 -m venv .venv`. |
+| `Field instance.capacity must be defined` | `databricks database create-database-instance` needs `--capacity` even though `--help` shows it as optional. Use `--capacity CU_1`. |
+| `fastapi ... requires starlette<0.39.0, but you have starlette 1.3.1` in the build log | Harmless. Streamlit pulls a newer `starlette` over the one in the Apps base image. Nothing in this app uses FastAPI; the deployment still succeeds. |
+| Deployed app can't reach the database, but local scripts can | The Lakebase instance isn't attached to the app as a **resource** (Section 7). Without it the app's service principal cannot mint a token for the instance, no matter what the grants say. |
 
 ---
 _Generated by [Claude Code](https://claude.ai/code)_
